@@ -1,0 +1,97 @@
+# Keeps this fork in step with seedds/nxnative: every 6 hours (or by hand: Actions > Sync upstream > Run workflow) it merges upstream's main into the branch
+# auto-sync-upstream, applies the fork's usual fixes, runs win/tests, and opens a PR; with the tests green it merges the PR too.
+#   usual fixes: README.md and .github/ stay the fork's; dmsh_chain.h is regenerated; an arm64 dmsh_xlate.dll (Windows x64 cannot load it) is rebuilt from source and the lock follows
+#   anything else that conflicts (e.g. the lock's Metal / spirv-cross lines, Python or C sources both sides changed): the merge is aborted and an issue says which files
+# To only open the PR and merge by hand: Settings > Secrets and variables > Actions > Variables: AUTO_MERGE = false
+name: Sync upstream
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+concurrency: sync-upstream
+jobs:
+  sync:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      UPSTREAM: https://github.com/seedds/nxnative.git
+      BRANCH: auto-sync-upstream
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Merge upstream
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch -q upstream main
+          n=$(git rev-list --count HEAD..upstream/main)
+          if [ "$n" -eq 0 ]; then echo "up to date with upstream"; exit 0; fi
+          up=$(git rev-parse --short upstream/main)
+          if gh pr list --head "$BRANCH" --state open --json body -q '.[].body' | grep -q "upstream@$up"; then echo "a PR for upstream@$up is already open"; exit 0; fi
+
+          git checkout -q -B "$BRANCH"
+          git merge --no-commit --no-ff upstream/main > merge.log 2>&1 || true
+          # the fork's own files win: README, the workflows (a GITHUB_TOKEN push may not change them anyway)
+          git checkout HEAD -- README.md
+          git rm -rq --cached .github && git checkout HEAD -- .github && git clean -fdq .github
+          git checkout --ours -- dm/gfx/nvn/dmsh_chain.h 2>/dev/null && git add dm/gfx/nvn/dmsh_chain.h || true
+          left=$(git diff --name-only --diff-filter=U)
+          if [ -n "$left" ]; then
+            git merge --abort
+            title="Upstream sync needs a manual merge (upstream@$up)"
+            if [ -z "$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[].number')" ]; then
+              gh issue create --title "$title" --body "Merging seedds/nxnative main ($n commits, upstream@$up) conflicts in files the workflow does not resolve on its own:
+
+          $(echo "$left" | sed 's/^/- /')
+
+          Merge by hand: git fetch upstream && git merge upstream/main"
+            fi
+            echo "conflicts: $left"; exit 0
+          fi
+
+          # upstream's dmsh_xlate.dll is an arm64 PE (0xaa64): dotnet on Windows x64 refuses it. Rebuild from the in-repo source (AnyCPU) and record it in the lock
+          machine=$(python -c "import struct;b=open('dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate.dll','rb').read();o=struct.unpack_from('<I',b,0x3c)[0];print(hex(struct.unpack_from('<H',b,o+4)[0]))")
+          if [ "$machine" != "0x14c" ]; then
+            dotnet build dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -o "$RUNNER_TEMP/xlate" -nologo -v q
+            cp "$RUNNER_TEMP/xlate/dmsh_xlate.dll" "$RUNNER_TEMP/xlate/dmsh_xlate.pdb" dm/gfx/tools/dmsh_xlate_bin/
+            fp=$(sha256sum dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate.dll | cut -c1-16)
+            sed -i "s/^dmsh_xlate.dll\t.*/dmsh_xlate.dll\t$fp/" dm/gfx/tools/dmsh_chain.lock
+            echo "rebuilt dmsh_xlate.dll (was machine $machine), lock $fp"
+          fi
+          python dm/gfx/tools/dmsh_chain.py --header
+
+          python -m pip install -q lz4 capstone fonttools pillow
+          if python win/tests/test_win.py > tests.log 2>&1; then tests=passed; else tests=FAILED; fi
+          tail -5 tests.log
+          rm -f merge.log tests.log
+          git add -A
+          git commit -q -m "Merge seedds/nxnative main ($n commits, upstream@$up)"
+          git push -q -f origin "$BRANCH"
+
+          body="Merges seedds/nxnative main (upstream@$up, $n commits), applied by the Sync upstream workflow.
+
+          $(git log --format='- %s' main..upstream/main | head -40)
+
+          README.md and .github/ stay the fork's; dmsh_chain.h is regenerated (dmsh_chain.py --header); a dmsh_xlate.dll that Windows x64 cannot load is rebuilt from source.
+          win/tests/test_win.py: **$tests**. Not run: dmsh_chain.py --check-tools (the Metal tools are not on the runner) and an IPA build."
+          pr=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')
+          if [ -n "$pr" ]; then gh pr edit "$pr" --title "Sync with upstream seedds/nxnative (upstream@$up)" --body "$body"
+          else gh pr create --base main --head "$BRANCH" --title "Sync with upstream seedds/nxnative (upstream@$up)" --body "$body"; fi
+          if [ "$tests" = passed ] && [ "${{ vars.AUTO_MERGE }}" != "false" ]; then gh pr merge "$BRANCH" --merge; fi
