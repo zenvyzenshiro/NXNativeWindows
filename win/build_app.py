@@ -69,6 +69,30 @@ FRAMEWORKS_BASE = ['QuartzCore', 'Metal', 'MetalFX', 'GameController', 'CoreHapt
 IMPORT = re.compile(r'^\s*#\s*(?:import|include)\s*<(\w+)/', re.M)
 
 
+def unpack_romfs_image(img, dst):
+    """A DMROMFS1 image as a RomFS folder, for the steps that need one (mods' overlay, split data); reused while the image is unchanged"""
+    img = os.fspath(img); st = os.stat(img); stamp = Path(dst).with_name(Path(dst).name + '.stamp'); want = f'{st.st_size} {st.st_mtime_ns}'
+    if Path(dst).is_dir() and stamp.is_file() and stamp.read_text() == want: return Path(dst)
+    t(f'unpacking {img} into a folder ({st.st_size / 2**30:.1f} GB) for the mods / split data'); shutil.rmtree(dst, ignore_errors=True); stamp.unlink(missing_ok=True)
+    m = rfs.Image(img); n = 0
+    with open(img, 'rb') as f:
+        todo = [(0, Path(dst))]
+        while todo:
+            k, d = todo.pop(); d.mkdir(parents=True, exist_ok=True)
+            for name, j in m.children(k):
+                off, size, _, _, isfile, _ = m.entry(j)
+                if not isfile: todo.append((j, d / name)); continue
+                f.seek(off); left = size
+                with open(d / name, 'wb') as o:
+                    while left:
+                        b = f.read(min(left, 8 << 20))
+                        if not b: die(f'{img}: ends inside {name}')
+                        o.write(b); left -= len(b)
+                n += 1
+    stamp.write_text(want); t(f'unpacked {n:,} files')
+    return Path(dst)
+
+
 def frameworks(sdk, files):
     fw_dir = sdk / 'System/Library/Frameworks'
     out = list(FRAMEWORKS_BASE)
@@ -271,11 +295,11 @@ def main():
     for m in mods:
         if not ((patched / f'{m}.patched.bin').exists() and (patched / f'{m}.fixups.tsv').exists()): die(f'no rewritten module {patched}/{m} (run dm/tools/patch_nso.py first)')
     if not (romfs / marker).exists(): die(f'no RomFS at {romfs} (missing {marker})')
-    if image and env.get('NXW_MODS_ROMFS'): die('mods\' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)')
-    if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'): die('a split build copies the RomFS as a folder, and this extraction is one RomFS image (RomFS.img): build without --split-data')
+    if image and (env.get('NXW_MODS_ROMFS') or env.get('NXW_SPLIT_DATA', '') not in ('', '0')):   # both lay out the RomFS as a folder, and the NSP script extracts one image (nx_extract --romfs-image)
+        romfs, image = rfs.Path(unpack_romfs_image(romfs, w / 'build/romfs_unpacked')), False
     if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them
-        import mods
-        romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
+        import mods as mod_overlay   # not "mods": that name is the module list gen_embed.py takes below
+        romfs = mod_overlay.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
     hdr = (DM / 'gfx/nvn/dmsh_chain.h').read_text(encoding='utf-8')
     v = (re.search(r'^#define DMSH_CHAIN "(.*)"', hdr, re.M) or die('no DMSH_CHAIN in dmsh_chain.h')).group(1)
     gfx = env.get('GFXAPI') or ('nvn' if list((msl_ios / f'b-{v}').glob('*_b.metallib')) else 'vulkan' if (msl_ios / 'vk/vk_shaders.metallib').exists()

@@ -178,6 +178,20 @@ class BcSoft(unittest.TestCase):
                     self.assertLessEqual(max(abs(x - y) for x, y in zip(f8, p)), 1, f'{fmt} mode {mi}')
 
 
+class UnpackRomfsImage(unittest.TestCase):
+    def test_round_trip_and_reuse(self):
+        sys.path.insert(0, str(REPO / 'dm/tools')); import romfs_image
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / 'src'; (src / 'arc/sub').mkdir(parents=True); (src / 'ui').mkdir()
+            files = {'arc/data.trpfd': b'index', 'arc/sub/big.bin': os.urandom(3 << 20), 'ui/empty.bin': b'', 'top.txt': b'top'}
+            for rel, b in files.items(): (src / rel).write_bytes(b)
+            img = Path(d) / 'RomFS.img'; romfs_image.pack(src, img)
+            out = build_app.unpack_romfs_image(img, Path(d) / 'unpacked')
+            self.assertEqual({p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob('*') if p.is_file()}, files)
+            (out / 'top.txt').write_bytes(b'marker')   # an unchanged image reuses the folder
+            build_app.unpack_romfs_image(img, out); self.assertEqual((out / 'top.txt').read_bytes(), b'marker')
+
+
 class PackIpa(unittest.TestCase):
     def test_exec_bit_on_windows(self):
         with tempfile.TemporaryDirectory() as d:
