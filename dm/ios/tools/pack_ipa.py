@@ -165,7 +165,7 @@ class Zip:
         left, at = csize, info.header_offset + 30 + nl + el
         h = self.local(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
         while left:
-            b = os.pread(old.fileno(), min(CHUNK, left), at)
+            b = pread(old, min(CHUNK, left), at)
             if not b: sys.exit(f'[RED] pack_ipa: the old IPA ended while {e.name} was copied from it')
             self.w(b); left -= len(b); at += len(b)
         self.central(e, h, method, crc, csize, usize)
@@ -200,6 +200,11 @@ def fingerprint(e, deflate):
     return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, deflate]
 
 
+def pread(f, n, at):   # os.pread is POSIX only: Windows' Python has none, so a pack beside an earlier IPA reads with seek + read there
+    if hasattr(os, 'pread'): return os.pread(f.fileno(), n, at)
+    f.seek(at); return f.read(n)
+
+
 def match(e, row, info, old, idx, apfs):   # one header comparison for both the kept run and later compressed copies
     if info is None: return None
     mode, data = e.st.st_mode if e.st else DIR_MODE, b''
@@ -213,7 +218,7 @@ def match(e, row, info, old, idx, apfs):   # one header comparison for both the 
         if (info.compress_type, info.CRC, info.compress_size, info.file_size) != (method, crc, csize, usize): return None
     h = header(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
     if info.header_offset < 0 or info.header_offset + len(h[0]) + csize > idx['ipa'][0]: return None
-    if os.pread(old.fileno(), len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
+    if pread(old, len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
     return h
 
 
@@ -290,6 +295,7 @@ def main():
                 pend.append(('load', e, pool.submit(load, e.path, deflate))); inflight += e.st.st_size
             while pend: inflight -= one()
         z.close()
+        if old: old.close(); old = None   # Windows refuses to replace a file that is open, and every entry has been read from it
         st = os.stat(part)   # bind the index to this file before publishing; rename preserves its mtime
         os.replace(part, a.out)
     except BaseException:
