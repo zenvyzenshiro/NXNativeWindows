@@ -41,9 +41,10 @@ app_pool	0xCD500000
 tex_flush_upload	on
 render_cond	on
 tex_dirty_upload	on
-# 60 fps (30 on the Switch): the host decides each frame's step in whole vsyncs and holds the frame that long (rewriter stubs at FPSLocker's sites, patches.py FRAME_STEP);
-# 30 when 60 does not hold, game time = real time. DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) saves power, 0 = the game's own step. Until the host has decided a step
-# (the first frames) the stub steps by the measured frame time
+# The profile target remains 60 fps (30 on the Switch). TOTK's host frame step uses 120 Hz units: step 2 = 60 fps, step 3 = 40 fps, step 4 = 30 fps;
+# serious thermal uses 40 only after the Metal callback observer verifies 120 Hz, critical thermal uses 30, and a slower/unverified link safely stays at 30.
+# The adaptive scheduler may hold a frame longer when its work cannot fit; game-time debt is paid back so game time remains aligned with real time. DM_FPS_TARGET=30 saves power, 0 = the game's own step.
+# Until the host has decided a step (the first frames) the stub steps by measured elapsed time. No new 40 fps launcher option is introduced.
 fps_target	60
 
 # ---- Shader split (shader_split.py) ----

@@ -89,6 +89,10 @@ def main():
 
     app = derived / 'Build/Products/Release-iphoneos/DmIOS.app'
     info = plistlib.loads((app / 'Info.plist').read_bytes())
+    if info.get('CADisableMinimumFrameDurationOnPhone') is not True:
+        raise RuntimeError(
+            'Generated Info.plist must set CADisableMinimumFrameDurationOnPhone to true'
+        )
     executable = app / info['CFBundleExecutable']
     if not executable.is_file():
         raise RuntimeError(f'No linked executable: {executable}')

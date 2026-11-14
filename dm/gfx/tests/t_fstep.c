@@ -18,6 +18,21 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
     }
 }
 
+
+static void run_scaled(sim *m, int n, double w, int kmin,
+                       int kmax, int fixed, int scale) {
+    for (int i = 0; i < n; i++) {
+        int k = m->s.k ? m->s.k : kmin;
+        int step = m->next ? m->next : kmin;
+        double shown = w > k ? w : k;
+        m->real += shown;
+        m->game += step;
+        m->next = nvn_fstep_next_scaled(
+            &m->s, shown, w, kmin, kmax, fixed, m->slow, scale
+        );
+    }
+}
+
 int main(void) {
     char b[160];
     {   sim m = {0}; run(&m, 600, 0.5, 1, 3, 0);
@@ -309,6 +324,93 @@ int main(void) {
         sim m = {0}; m.s.shown_slack = 60.0 / 165; run(&m, 60, 0.5, 1, 3, 0); run(&m, 300, 1.32, 1, 3, 0);
         check(m.s.k == 2, "  the slack does not hide work: 22 ms frames still step to hold 2");
     }
+
+    // The 120 Hz timebase uses twice the legacy scheduler's time units.
+    {
+        nvn_fstep s = {.k = 2, .step = 2, .kmin = 2, .hold = FSTEP_HOLD0 * 2};
+        nvn_fstep_next_scaled(&s, 0.0, 0.0, 2, 4, 0, 0, 2);
+        check(s.debt == -2.0, "120 Hz timebase: the remembered lead remains one 60 Hz vsync in duration");
+    }
+    {
+        sim m = {0};
+        run_scaled(&m, 1200, 1.5, 2, 4, 0, 2);
+        check(m.s.k == 2 && m.next == 2 && m.game == m.real,
+              "120 Hz timebase: stable 60 fps uses step 2 and keeps game time");
+        check(m.s.hold == FSTEP_HOLD0 * 2,
+              "120 Hz timebase: one-second trial hold is scaled to 120 units");
+    }
+    {
+        sim m = {0};
+        run_scaled(&m, 1200, 2.5, 3, 4, 0, 2);
+        check(m.s.k == 3 && m.next == 3 && m.game == m.real,
+              "120 Hz timebase: stable 40 fps uses step 3 and keeps game time");
+    }
+    {
+        sim m = {0};
+        run_scaled(&m, 1200, 3.5, 4, 4, 0, 2);
+        check(m.s.k == 4 && m.next == 4 && m.game == m.real,
+              "120 Hz timebase: stable 30 fps uses step 4 and keeps game time");
+    }
+    {
+        sim m = {0};
+        run_scaled(&m, 120, 1.5, 2, 4, 0, 2);
+        run_scaled(&m, 1, 1.5, 3, 4, 0, 2);
+        run_scaled(&m, 3, 3.3, 3, 4, 0, 2);
+        check(m.s.k == 4 && m.next == 4,
+              "120 Hz timebase: three late 40 fps frames step down to 30 fps");
+    }
+    {
+        sim m = {0};
+
+        run_scaled(&m, 600, 1.5, 2, 4, 0, 2);
+        run_scaled(&m, 1, 1.5, 3, 4, 0, 2);
+        check(m.s.k == 3 && m.next == 3,
+              "120 Hz transition: 60 to 40 fps");
+
+        run_scaled(&m, 600, 2.5, 3, 4, 0, 2);
+        run_scaled(&m, 1, 2.5, 4, 4, 0, 2);
+        check(m.s.k == 4 && m.next == 4,
+              "120 Hz transition: 40 to 30 fps");
+
+        run_scaled(&m, 300, 3.5, 4, 4, 0, 2);
+        run_scaled(&m, 1, 3.5, 3, 4, 0, 2);
+        check(m.s.k == 3 && m.s.probe == 1 &&
+              m.s.grace == FSTEP_GRACE,
+              "120 Hz recovery: 30 to 40 starts a clock-recovery probe");
+
+        run_scaled(&m, 60, 2.5, 3, 4, 0, 2);
+        check(m.s.k == 3 && m.s.probe == 2,
+              "120 Hz recovery: the 40 fps probe receives its grace and trial");
+
+        run_scaled(&m, 1, 2.5, 2, 4, 0, 2);
+        check(m.s.k == 2 && m.s.probe == 1 &&
+              m.s.grace == FSTEP_GRACE,
+              "120 Hz recovery: 40 to 60 also starts a clock-recovery probe");
+
+        check(m.game == m.real,
+              "120 Hz transitions: game time remains equal to real time");
+    }
+
+    // Preserve the legacy step-up rounding tolerance in real time.
+    {
+        sim m = {0};
+        m.s.k = m.s.step = m.next = 2;
+        m.s.kmin = m.s.ckmin = 2;
+        m.s.hold = 120;
+        m.s.late_run = 2;
+        run_scaled(&m, 1, 3.06, 2, 4, 0, 2);
+        check(m.s.k == 3,
+              "120 Hz timebase: step-up rounding tolerance stays 0.83 ms");
+    }
+
+    // Verify that the expanded GPU reference array supports step 4.
+    {
+        nvn_fgpu g = {0};
+        int slowed = nvn_fstep_gpu_slowed(&g, 2.0, 4, 4, 0);
+        check(!slowed && g.ref_at[4] == 2.0,
+              "120 Hz GPU reference: step 4 has a valid reference slot");
+    }
+
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }

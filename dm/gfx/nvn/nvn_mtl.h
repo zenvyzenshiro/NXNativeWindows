@@ -50,3 +50,19 @@ void *mtl_device_classic(void);   // the same for a layer that draws only on cla
 uint64_t mtl_ext_tex(void *tex);
 uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
 void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
+
+// Display-link timing. The requested mode is not evidence of the callback cadence:
+// mtl_link_120hz_ready becomes true only after the callback observer confirms it.
+int mtl_link_active(void);
+int mtl_link_stalled(void);
+int mtl_link_rate(void);             // configured mode, not a measured callback rate
+int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);
+int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns);
+int mtl_link_wait_vsync(uint64_t *seen, uint64_t timeout_ns);
+int mtl_link_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms);
+int mtl_link_observed_hz(void);
+int mtl_link_120hz_ready(void);
+void mtl_link_rate_reset(void);
+void mtl_link_rate_sample(double monotonic_seconds);   // called by Metal callback; exposed so tests can feed a deterministic clock
+int mtl_link_wait_period_120(int timebase_ticks, uint64_t timeout_ns);   // callback-paced deadline, with durations in a 120 Hz game timebase
+int nvn_game_fps_link_mode(void);   // HLE may request 120 Hz while the effective frame cap remains 30 pending verification

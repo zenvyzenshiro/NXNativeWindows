@@ -6,6 +6,7 @@
 #include <time.h>
 #include <errno.h>
 static uint64_t test_now = 10000000000ull;
+static uint64_t test_link_interval = 2000000ull;
 static unsigned test_waits, test_spurious;
 static int test_silent;
 static int test_clock_gettime(clockid_t clock, struct timespec *t) {
@@ -17,7 +18,9 @@ static int test_pthread_cond_timedwait(pthread_cond_t *, pthread_mutex_t *, cons
 #define clock_gettime test_clock_gettime
 #define pthread_cond_timedwait test_pthread_cond_timedwait
 #define nvn_game_fps nvn_game_fps_mtl_default
+#define NVN_TEST_HLE_LINK_MODE 1
 #include "../nvn/nvn_mtl.m"
+#undef NVN_TEST_HLE_LINK_MODE
 #undef nvn_game_fps
 #undef pthread_cond_timedwait
 #undef clock_gettime
@@ -38,14 +41,27 @@ static int test_pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mu
     test_waits++;
     if (test_spurious) { test_spurious--; return 0; }
     uint64_t end = (uint64_t)deadline->tv_sec * 1000000000ull + deadline->tv_nsec;
-    if (test_silent || test_now + 2000000ull >= end) { test_now = end; return ETIMEDOUT; }
-    test_now += 2000000ull; g_link_tick_n++;
+    if (test_silent || test_now + test_link_interval >= end) { test_now = end; return ETIMEDOUT; }
+    test_now += test_link_interval; g_link_tick_ns = test_now; g_link_callback_ns = test_now; g_link_tick_n++;
     return 0;
 }
 // Ticks per wait over 50 waits of the given kind (frames that take no time: each wait is the whole frame)
 static double per_wait(int own, int n) {
     uint64_t t0 = g_link_tick_n;
     for (int i = 0; i < 50; i++) own ? mtl_link_wait_ticks(n, 100000000ull) : mtl_link_wait_tick(n, 100000000ull);
+    return (g_link_tick_n - t0) / 50.0;
+}
+static void feed_link_rate(int hz) {
+    double t = 10.0;
+    mtl_link_rate_reset();
+    mtl_link_rate_sample(t);
+    for (int i = 0; i < 8; i++) { t += 1.0 / hz; mtl_link_rate_sample(t); }
+}
+static double per_period_120(int units) {
+    mtl_link_rate_reset();   // also starts a fresh 120 Hz deadline phase
+    mtl_link_wait_period_120(units, 100000000ull);   // first frame initializes the phase
+    uint64_t t0 = g_link_tick_n;
+    for (int i = 0; i < 50; i++) mtl_link_wait_period_120(units, 100000000ull);
     return (g_link_tick_n - t0) / 50.0;
 }
 // Exercise the real acquire so the conversion from the requested frame rate to link ticks is covered too.
@@ -88,10 +104,68 @@ int main(void) { @autoreleasepool {
     CHECK(nvn_game_fps() == 60, "native 60 fps cap configures the display link");
     setenv("DM_FPS_TARGET", "0", 1); g_present_cap = -1;
     _Alignas(8) float state[10] = {60}; dm_fps_state = (uint8_t *)state;   // include the fixed-step flag at +0x24 read by rt_period_ns
+    unsetenv("DM_FPS");
+    atomic_store(&g_fs_k, 2);
+    CHECK(nvn_game_fps_link_mode() == 0, "TOTK's normal 2-tick hold leaves the 60 Hz link mode unchanged");
+    atomic_store(&g_fs_k, 3);
+    CHECK(nvn_game_fps_link_mode() == 2, "TOTK's adaptive 3-tick hold requests the 120 Hz link mode");
+    atomic_store(&g_fs_k, 4);
+    atomic_store(&g_fs_link120_pending, 1);
+    CHECK(nvn_game_fps_link_mode() == 2, "TOTK's safe 30 fps fallback keeps the 120 Hz link requested while adaptive 40 is pending");
+    atomic_store(&g_fs_link120_pending, 0);
+    setenv("DM_FPS", "60", 1);
+    CHECK(nvn_game_fps_link_mode() == 0, "an explicit 60 fps test pin disables the adaptive link override");
+    unsetenv("DM_FPS"); atomic_store(&g_fs_k, 2);
     acquire_ticks(120, 1, 1, 2, "the 60 fps frame step keeps 60 Hz vsyncs");
     state[0] = 30;
     acquire_ticks(120, 1, 1, 4, "the 30 fps frame step keeps two 60 Hz vsyncs");
     dm_fps_state = NULL;
+    test_link_interval = 8333334ull; g_link_tick_ns = g_link_callback_ns = test_now;
+    feed_link_rate(120);
+    CHECK(mtl_link_observed_hz() == 120 && mtl_link_120hz_ready(), "the callback observer independently verifies 120 Hz");
+    uint64_t callback_now = test_now;
+    test_now += 251000000ull;
+    CHECK(mtl_link_observed_hz() == 0 && !mtl_link_120hz_ready(), "a silent display link loses stale 120 Hz authorization");
+    test_now = callback_now;
+    feed_link_rate(120);   // re-prime the observer after the deliberate silence
+    double ticks = per_period_120(3);
+    printf("120 Hz timebase: a 25 ms frame waits %.2f callback ticks\n", ticks);
+    CHECK(ticks == 3, "a 25 ms frame waits for three actual 120 Hz callbacks");
+    // A silent callback stream must fail the 120 Hz period wait.
+    mtl_link_rate_reset();
+    g_link_callback_ns = test_now;
+    test_silent = 1;
+    CHECK(mtl_link_wait_period_120(3, 100000000ull),
+          "the first 120 Hz period wait initializes its phase");
+    unsigned period_waits = test_waits;
+    uint64_t period_timeout_start = test_now;
+    uint64_t period_callback = g_link_callback_ns;
+    CHECK(!mtl_link_wait_period_120(3, 5000000ull) &&
+          test_waits == period_waits + 1 &&
+          test_now - period_timeout_start == 5000000ull &&
+          g_link_callback_ns == period_callback,
+          "a silent 120 Hz callback stream times out without inventing a callback");
+    test_silent = 0;
+
+    // An already-late frame must not wait for an additional display refresh.
+    mtl_link_rate_reset();
+    g_link_callback_ns = test_now;
+    CHECK(mtl_link_wait_period_120(3, 100000000ull),
+          "the late-frame test initializes its phase");
+    unsigned late_waits = test_waits;
+    uint64_t late_callback = g_link_callback_ns;
+    test_now += 25000000ull;
+    CHECK(mtl_link_wait_period_120(3, 100000000ull),
+          "an already-late 120 Hz frame proceeds immediately");
+    CHECK(test_waits == late_waits && g_link_callback_ns == late_callback,
+          "an already-late frame does not wait for another display callback");
+    test_link_interval = 16666667ull; g_link_tick_ns = g_link_callback_ns = test_now;
+    feed_link_rate(60);
+    CHECK(mtl_link_observed_hz() == 60 && !mtl_link_120hz_ready(), "a 60 Hz callback stream cannot authorize 40 fps");
+    ticks = per_period_120(4);
+    printf("60 Hz fallback: a 33.3 ms frame waits %.2f callback ticks\n", ticks);
+    CHECK(ticks == 2, "a 33.3 ms frame waits for two actual 60 Hz callbacks");
+    mtl_link_rate_reset();
     g_link_mode = 1;
     CHECK(mtl_link_rate() == 60, "a 60 Hz link reports 60");
     a = per_wait(0, 1);

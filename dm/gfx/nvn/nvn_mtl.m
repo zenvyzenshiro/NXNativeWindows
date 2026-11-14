@@ -20,6 +20,7 @@
 #include <dispatch/dispatch.h>
 #endif
 #include "nvn_mtl.h"
+#include "nvn_link_rate.h"
 #include "nvn_obj.h"
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/bc_soft.h"
@@ -111,7 +112,43 @@ static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_link_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_link_tick_ns, g_link_tick_n;
+static _Atomic uint64_t g_link_callback_ns;   // every raw Metal callback, before optional virtual-tick filtering
 static uint64_t g_link_dropped;
+// Raw callback cadence, kept separately from g_link_mode (which is only the
+// requested/configured rate). Callback-thread samples and present-thread resets
+// share this small lock; the hot readers use the atomic results below.
+static pthread_mutex_t g_link_rate_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_link_rate_state g_link_rate_state;
+static _Atomic int g_link_observed_hz, g_link_120_ready;
+static uint64_t g_link_period_start_ns, g_link_period_remainder, g_link_period_generation;   // acquire-thread 120 Hz deadline phase; generation protects mode resets
+void mtl_link_rate_reset(void) {
+    pthread_mutex_lock(&g_link_rate_mu);
+    nvn_link_rate_reset(&g_link_rate_state);
+    atomic_store(&g_link_observed_hz, 0);
+    atomic_store(&g_link_120_ready, 0);
+    g_link_period_start_ns = g_link_period_remainder = 0;
+    g_link_period_generation++;
+    pthread_mutex_unlock(&g_link_rate_mu);
+}
+void mtl_link_rate_sample(double seconds) {
+    pthread_mutex_lock(&g_link_rate_mu);
+    nvn_link_rate_sample(&g_link_rate_state, seconds);
+    atomic_store(&g_link_observed_hz, g_link_rate_state.observed_hz);
+    atomic_store(&g_link_120_ready, g_link_rate_state.ready120);
+    pthread_mutex_unlock(&g_link_rate_mu);
+    // Publish the raw callback on the same clock the acquire deadline uses;
+    // wake waiters before any optional virtual-tick filtering is applied.
+    pthread_mutex_lock(&g_link_mu);
+    __atomic_store_n(&g_link_callback_ns, now_ns(), __ATOMIC_RELAXED);
+    pthread_cond_broadcast(&g_link_cv);
+    pthread_mutex_unlock(&g_link_mu);
+}
+static int mtl_link_callback_fresh(void) {
+    uint64_t last = __atomic_load_n(&g_link_callback_ns, __ATOMIC_RELAXED), now = now_ns();
+    return last && now >= last && now - last <= 250000000ull;
+}
+int mtl_link_observed_hz(void) { return mtl_link_callback_fresh() ? atomic_load(&g_link_observed_hz) : 0; }
+int mtl_link_120hz_ready(void) { return mtl_link_callback_fresh() && atomic_load(&g_link_120_ready); }
 static uint64_t g_link_empty;   // Under g_pq_mu: ticks that found no new frame queued (counted here, not as ticks minus presents: presents before the link starts and while it is rescued are not on ticks)
 static double g_link_hold_until; static uint64_t g_link_held;   // Changed only on the display-link callback thread: the time the previous frame must stay on screen until by its present interval (0 = no hold), and the ticks that took no new frame because of it
 static int g_pq_inflight;   // Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
@@ -9861,8 +9898,15 @@ static const char *cctx_snap(void) {
 }
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
-int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
-    return dm_mem_guard() ? 30 : env > 0 ? env : nvn_game_fps() == 30 ? 30 : 60; }   // the memory guard caps every game at 30 while memory is low
+#ifndef NVN_TEST_HLE_LINK_MODE
+__attribute__((weak)) int nvn_game_fps_link_mode(void) { return 0; }   // HLE may request 120 Hz while 40 fps is pending callback verification
+#endif
+int mtl_fps_target(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
+    int fps = env > 0 ? env : nvn_game_fps();
+    return dm_mem_guard() ? 30 : fps == 30 ? 30 : fps == 40 ? 40 : 60;   // memory guard caps every game at 30
+}
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier
@@ -10926,6 +10970,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
 - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
     (void)link;
     double cb = CACurrentMediaTime();
+    mtl_link_rate_sample(cb);   // raw callback cadence and deadline wake, before virtual-tick filtering
     pthread_mutex_lock(&g_pq_mu);
     if (g_stall_t0) { uint64_t since = dm_focus_in_since(), t = now_ns();
         MLOG("display link recovered: stalled %.0f ms (%.0f ms of it active), fallback dropped %llu frames (stall #%llu)", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
@@ -10966,7 +11011,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
-    g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
+    g_link_hold_until = submitted && it.period >= 0.0249 ? update.targetPresentationTimestamp + it.period : 0;   // include the exact 25 ms period of a 40 fps frame
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
@@ -11033,7 +11078,9 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     }
     if (g_rescue_mode) want = 0;
     pthread_mutex_unlock(&g_pq_mu);
-    if (want && mtl_fps_target() == 30) want = 3;   // Power-saving mode: display link at 30 Hz
+    int game_link_mode = nvn_game_fps_link_mode();
+    if (want && game_link_mode == 2) want = 2;   // TOTK thermal or adaptive 40 fps: request 120 Hz; callback proof still gates the serious-thermal cap
+    else if (want && mtl_fps_target() == 30) want = 3;   // Power-saving mode: display link at 30 Hz
     if (want) front_screen_match(want == 3 ? 30 : want == 2 ? 120 : 60);
     // The screen's rate changed (switched by front_screen_match, or another screen): the range again, virtual ticks or none. Taken only once the link object exists, so a change
     // while its thread starts (after link_main read the rate) is not lost
@@ -11043,6 +11090,7 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     if (lk && lk.preferredFrameLatency != lat) { lk.preferredFrameLatency = lat; MLOG("display link: frame latency %d (%s; frame %llu)", lat, link_latency_why(), (unsigned long long)atomic_load(&g_cur_frame)); }
     if (want == applied) return;
     g_link_mode = want;
+    mtl_link_rate_reset();   // a mode change starts a new callback-cadence measurement
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
         if (!front_metal_layer()) return;
@@ -11304,8 +11352,60 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) {
     if (vsyncs < 1) vsyncs = 1;
     return mtl_link_wait_ticks(g_link_mode == 3 ? (vsyncs + 1) / 2 : vsyncs * (g_link_mode == 2 ? 2 : 1), timeout_ns);
 }
-// The display link's rate: 120 Hz (DM_PRESENT_LINK=2), 60, or 30 in power-saving mode
+// The configured display-link mode (not a measurement of callback cadence).
 int mtl_link_rate(void) { return g_link_mode == 3 ? 30 : g_link_mode == 2 ? 120 : 60; }
+// Wait until the display-link callback reaches the next deadline in the game's
+// 120 Hz timebase. Unlike converting to a requested tick count, this remains
+// correctly paced when iOS delivers 60, 90 or 120 callbacks per second.
+int mtl_link_wait_period_120(int units, uint64_t timeout_ns) {
+    if (!mtl_link_active()) return 0;
+    if (units < 1) units = 1;
+    uint64_t now = now_ns(), deadline, generation;
+    pthread_mutex_lock(&g_link_rate_mu);
+    if (!g_link_period_start_ns) {
+        g_link_period_start_ns = now;
+        g_link_period_remainder = 0;
+        pthread_mutex_unlock(&g_link_rate_mu);
+        return 1;
+    }
+    uint64_t numerator = (uint64_t)units * 1000000000ull + g_link_period_remainder;
+    uint64_t period = numerator / 120ull;
+    g_link_period_remainder = numerator % 120ull;
+    deadline = g_link_period_start_ns + period;
+    generation = g_link_period_generation;
+    pthread_mutex_unlock(&g_link_rate_mu);
+    if (now >= deadline) {
+        pthread_mutex_lock(&g_link_rate_mu);
+        if (generation == g_link_period_generation) g_link_period_start_ns = now;
+        else { pthread_mutex_unlock(&g_link_rate_mu); return 0; }
+        pthread_mutex_unlock(&g_link_rate_mu);
+        return 1;   // the game is already behind; do not wait another refresh
+    }
+
+    // A display-link callback can land a few microseconds after the ideal
+    // deadline because 1/120 s is not an integer number of nanoseconds. Give
+    // that callback a small grace, but never wait beyond the caller's timeout.
+    uint64_t wait_until = deadline + 1000000ull;
+    if (timeout_ns && wait_until > now + timeout_ns) wait_until = now + timeout_ns;
+    pthread_mutex_lock(&g_link_mu);
+    while (__atomic_load_n(&g_link_callback_ns, __ATOMIC_RELAXED) < deadline) {
+        now = now_ns();
+        if (now >= wait_until) break;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t left = wait_until - now;
+        ts.tv_sec += left / 1000000000ull; ts.tv_nsec += left % 1000000000ull;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_cond_timedwait(&g_link_cv, &g_link_mu, &ts) == ETIMEDOUT &&
+            __atomic_load_n(&g_link_callback_ns, __ATOMIC_RELAXED) < deadline) break;
+    }
+    int reached = __atomic_load_n(&g_link_callback_ns, __ATOMIC_RELAXED) >= deadline;
+    pthread_mutex_unlock(&g_link_mu);
+    pthread_mutex_lock(&g_link_rate_mu);
+    if (generation != g_link_period_generation) reached = 0;
+    else g_link_period_start_ns = reached ? deadline : now_ns();
+    pthread_mutex_unlock(&g_link_rate_mu);
+    return reached;
+}
 // The same wait counted in the display link's own ticks: one per frame for a frame rate as high as the link's (present_interval display at DM_PRESENT_HZ=120 on a 120 Hz link)
 int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) {
     if (!mtl_link_active()) return 0;
